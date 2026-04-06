@@ -1,0 +1,14 @@
+GST Registration Thresholds in India (2026):
+--------------------------------------------
+- Supply of Goods (Normal States): ₹40 lakh annual turnover
+- Supply of Services (Normal States): ₹20 lakh annual turnover
+
+Special Category States:
+- Goods & Services (Manipur, Mizoram, Nagaland, Tripura): ₹10 lakh
+- Goods (Arunachal, Meghalaya, Sikkim, Uttarakhand, Puducherry, Telangana): ₹20 lakh
+- Services (Most other Special States): ₹10 lakh to ₹20 lakh depending on state adoption
+
+Composition Scheme Threshold:
+- Goods (Traders/Manufacturers): ₹1.5 crore annual turnover
+- Goods (Special Category States & Himachal): ₹75 lakh annual turnover
+- Services (Standalone): ₹50 lakh annual turnover
