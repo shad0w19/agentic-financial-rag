@@ -19,6 +19,7 @@ Replaces:
 """
 
 import logging
+import re
 from typing import Dict, Optional, List, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -80,6 +81,17 @@ class ConfidenceComposer:
     OVERRIDE_THRESHOLD_HIGH = 0.80
     OVERRIDE_THRESHOLD_MEDIUM = 0.60
     OVERRIDE_THRESHOLD_LOW = 0.40
+    GROUNDED_TAX_TERMS = {
+        "tax", "deduction", "section", "regime", "gst", "income", "corporate", "standard deduction",
+        "80c", "80d", "rebate", "rs", "inr",
+    }
+    GENERIC_ANSWER_MARKERS = {
+        "the documents don't cover this specifically",
+        "please consult a tax professional",
+        "information not found",
+        "i have partial information",
+        "i need a bit more detail",
+    }
     
     def __init__(self):
         """Initialize confidence composer."""
@@ -179,6 +191,9 @@ class ConfidenceComposer:
         Returns:
             (should_override, action, replacement_answer)
         """
+        if verification_sig.confidence >= 0.9 and self._is_answer_grounded(answer):
+            return False, None, None
+
         if level == ConfidenceLevel.HIGH:
             # Direct answer, no override
             return False, None, None
@@ -196,7 +211,7 @@ class ConfidenceComposer:
                 f"Could you provide more specific details? For example: {self._suggest_clarification(answer)}"
             )
             return True, action, replacement
-        
+
         else:  # VERY_LOW
             # Admit uncertainty
             action = "admit_uncertainty"
@@ -206,6 +221,19 @@ class ConfidenceComposer:
                 f"ask a more specific question?"
             )
             return True, action, replacement
+
+    def _is_answer_grounded(self, answer: str) -> bool:
+        """Check whether the answer reflects concrete grounded content."""
+        if not answer or not answer.strip():
+            return False
+
+        answer_lower = answer.lower()
+        if any(marker in answer_lower for marker in self.GENERIC_ANSWER_MARKERS):
+            return False
+
+        has_number = bool(re.search(r"(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?", answer_lower))
+        has_tax_term = any(term in answer_lower for term in self.GROUNDED_TAX_TERMS)
+        return has_number or has_tax_term
     
     def _suggest_clarification(self, answer: str) -> str:
         """

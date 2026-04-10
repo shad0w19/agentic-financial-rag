@@ -30,6 +30,7 @@ from src.confidence.answer_quality_evaluator import (
     RetrievalQualityEvaluator,
     ReasoningQualityEvaluator,
     VerificationQualityEvaluator,
+    VerificationQualityMetrics,
 )
 
 
@@ -70,6 +71,7 @@ class QualityAssessmentPipeline:
         reasoning_steps: Optional[List[str]] = None,
         answer: Optional[str] = None,
         relevance_scores: Optional[List[float]] = None,
+        existing_verification: Optional[Dict[str, Any]] = None,
     ) -> QualityAssessmentResult:
         """
         Perform complete quality assessment of an answer.
@@ -81,6 +83,7 @@ class QualityAssessmentPipeline:
             reasoning_steps: Individual reasoning steps
             answer: Final answer to evaluate
             relevance_scores: Optional relevance scores for documents
+            existing_verification: Existing workflow verification result to reuse
             
         Returns:
             QualityAssessmentResult with three signals and overall quality
@@ -100,10 +103,26 @@ class QualityAssessmentPipeline:
         )
         
         # Step 3: Assess verification quality
-        verification_confidence, verification_metrics = self.verification_evaluator.evaluate(
-            answer=answer or "",
-            source_docs=retrieved_docs or [],
-        )
+        if isinstance(existing_verification, dict) and "confidence" in existing_verification:
+            verification_confidence = max(0.0, min(1.0, float(existing_verification.get("confidence", 0.0))))
+            verification_issues = existing_verification.get("issues", []) or []
+            verification_is_valid = bool(existing_verification.get("is_valid", False))
+            verification_metrics = VerificationQualityMetrics(
+                verified_claims=1 if verification_is_valid else 0,
+                unverified_claims=0 if verification_is_valid else len(verification_issues),
+                contradicted_claims=0,
+                hallucination_score=verification_confidence,
+            )
+            self.logger.debug(
+                "Using workflow verification in Phase C: valid=%s confidence=%.2f",
+                verification_is_valid,
+                verification_confidence,
+            )
+        else:
+            verification_confidence, verification_metrics = self.verification_evaluator.evaluate(
+                answer=answer or "",
+                source_docs=retrieved_docs or [],
+            )
         
         # Step 4: Combine signals
         overall_quality = (
@@ -142,6 +161,7 @@ class QualityAssessmentPipeline:
             },
             'verification': {
                 'confidence': verification_confidence,
+                'source': 'workflow' if isinstance(existing_verification, dict) and "confidence" in existing_verification else 'phase_c_recomputed',
                 'metrics': {
                     'verified_claims': verification_metrics.verified_claims,
                     'unverified_claims': verification_metrics.unverified_claims,

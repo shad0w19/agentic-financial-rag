@@ -59,7 +59,9 @@ def main():
     source_dirs = {
         "personal_tax": "data/raw/income_tax",
         "corporate_tax": "data/raw/corporate_tax",
-        "gst": "data/raw/gst"
+        "gst": "data/raw/gst",
+        "investment": "data/raw/investment",
+        "regulatory": "data/raw/regulatory",
     }
 
     try:

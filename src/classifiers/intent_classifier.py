@@ -28,7 +28,8 @@ class Intent(Enum):
     """Query intent categories."""
     TAX_GROUNDED = "tax_grounded"       # Tax-specific, domain expert queries
     GENERAL_FINANCE = "general_finance" # Finance but not tax-specific
-    TRIVIAL = "trivial"                 # Greeting, small talk, off-topic
+    TRIVIAL = "trivial"                 # Greeting/small talk
+    OUT_OF_SCOPE = "out_of_scope"       # Not finance/tax domain
 
 
 class IntentClassifier:
@@ -60,10 +61,17 @@ class IntentClassifier:
         ],
         Intent.TRIVIAL: [
             "This is a greeting, small talk, or casual conversation.",
-            "The query is off-topic, not related to finance or taxes.",
             "This is a trivial question like 'how are you' or general chit-chat.",
-            "The query does not relate to any financial or tax matter.",
             "This is a question about the assistant itself, not about finance.",
+            "This is a short greeting or polite acknowledgement from the user.",
+            "The user is saying hello, thanks, or asking what this assistant can do.",
+        ],
+        Intent.OUT_OF_SCOPE: [
+            "This query is unrelated to finance, taxes, investments, or compliance.",
+            "The user is asking for non-financial general knowledge or entertainment.",
+            "The question belongs to another domain like sports, weather, coding, or medicine.",
+            "This is not a finance advisory request and should be deflected politely.",
+            "The request is outside the assistant's supported financial scope.",
         ]
     }
     
@@ -77,6 +85,7 @@ class IntentClassifier:
         "deduction", "filing", "itr", "return", "assessment", "fy", "ay",
         "refund", "capital gains", "dividend", "interest income", "salary",
         "freelance", "business income", "loss", "cess", "surcharge",
+        "fema", "sebi", "dtaa", "lrs", "fatca", "compliance", "regulatory", "vda", "crypto",
     }
     
     FINANCE_KEYWORDS = {
@@ -91,13 +100,30 @@ class IntentClassifier:
         "hello", "hi", "hey", "how are you", "thanks", "thank you",
         "help", "support", "what can you do", "who are you", "what are you",
     }
+
+    OUT_OF_SCOPE_KEYWORDS = {
+        "joke", "funny", "movie", "sports", "cricket", "football", "weather",
+        "recipe", "medical", "medicine", "doctor", "diagnosis", "programming",
+        "python code", "capital of", "history", "geography", "astrology", "horoscope",
+        "love advice", "dating", "game", "music", "song", "kill", "murder", "violence",
+    }
+
+    AMBIGUOUS_TAX_KEYWORDS = {
+        "tax", "taxes", "deduction", "deductions", "filing", "compliance", "return",
+    }
+
+    SPECIFIC_TAX_MARKERS = {
+        "personal", "individual", "gst", "corporate", "section", "80c", "80d", "tds", "itr", "slab", "regime",
+        "fy", "ay", "salary", "business", "capital gains",
+        "investment", "portfolio", "mutual fund", "sip", "retirement", "fema", "sebi", "dtaa", "lrs",
+    }
     
     def __init__(self):
         """Initialize intent classifier."""
         self.logger = logging.getLogger(__name__)
         self._embedding_cache: Dict[str, Any] = {}
     
-    def classify(self, query_text: str) -> Tuple[Intent, float, Dict[str, float]]:
+    def classify(self, query_text: str) -> Tuple[Intent, float, Dict[str, float], bool, str]:
         """
         Classify query intent using learned classification.
         
@@ -105,17 +131,20 @@ class IntentClassifier:
             query_text: The query to classify
             
         Returns:
-            (intent, confidence, scores_dict)
+            (intent, confidence, scores_dict, is_ambiguous, ambiguity_reason)
             - intent: Best matching Intent category
             - confidence: Confidence score [0, 1]
             - scores_dict: Scores for all intents (for debugging/logging)
+            - is_ambiguous: Whether the query needs clarification before execution
+            - ambiguity_reason: Human-readable reason for ambiguity
         """
         if not query_text or len(query_text.strip()) < 3:
             return Intent.TRIVIAL, 1.0, {
                 Intent.TAX_GROUNDED: 0.0,
                 Intent.GENERAL_FINANCE: 0.0,
                 Intent.TRIVIAL: 1.0,
-            }
+                Intent.OUT_OF_SCOPE: 0.0,
+            }, False, ""
         
         query_lower = query_text.lower()
         
@@ -123,11 +152,14 @@ class IntentClassifier:
         keyword_intent, keyword_confidence = self._keyword_classification(query_lower)
         if keyword_confidence >= 0.85:  # High confidence from keywords
             self.logger.debug(f"Quick keyword match: {keyword_intent} ({keyword_confidence:.2f})")
-            return keyword_intent, keyword_confidence, {
+            scores = {
                 Intent.TAX_GROUNDED: 0.95 if keyword_intent == Intent.TAX_GROUNDED else 0.02,
                 Intent.GENERAL_FINANCE: 0.95 if keyword_intent == Intent.GENERAL_FINANCE else 0.02,
                 Intent.TRIVIAL: 0.95 if keyword_intent == Intent.TRIVIAL else 0.02,
+                Intent.OUT_OF_SCOPE: 0.95 if keyword_intent == Intent.OUT_OF_SCOPE else 0.02,
             }
+            ambiguous, reason = self._detect_ambiguity(query_lower, keyword_intent, scores)
+            return keyword_intent, keyword_confidence, scores, ambiguous, reason
         
         # Step 2: Semantic classification (learned)
         semantic_intent, semantic_confidence, scores = self._semantic_classification(query_text)
@@ -149,8 +181,9 @@ class IntentClassifier:
             f"Classification: {best_intent} ({blended_confidence:.2f}) | "
             f"Scores: {scores}"
         )
-        
-        return best_intent, blended_confidence, scores
+
+        is_ambiguous, ambiguity_reason = self._detect_ambiguity(query_lower, best_intent, scores)
+        return best_intent, blended_confidence, scores, is_ambiguous, ambiguity_reason
     
     def _keyword_classification(self, query_lower: str) -> Tuple[Intent, float]:
         """
@@ -162,12 +195,13 @@ class IntentClassifier:
         tax_score = sum(1 for kw in self.TAX_KEYWORDS if kw in query_lower)
         finance_score = sum(1 for kw in self.FINANCE_KEYWORDS if kw in query_lower)
         trivial_score = sum(1 for kw in self.TRIVIAL_KEYWORDS if kw in query_lower)
+        out_scope_score = sum(1 for kw in self.OUT_OF_SCOPE_KEYWORDS if kw in query_lower)
         
-        total = tax_score + finance_score + trivial_score
+        total = tax_score + finance_score + trivial_score + out_scope_score
         if total < 1:
-            return Intent.GENERAL_FINANCE, 0.35  # Default: assume finance if ambiguous
+            return Intent.OUT_OF_SCOPE, 0.60
         
-        max_score = max(tax_score, finance_score, trivial_score)
+        max_score = max(tax_score, finance_score, trivial_score, out_scope_score)
         confidence = max_score / (total + 1)  # +1 to handle edge cases
         
         if tax_score == max_score and tax_score > 0:
@@ -176,8 +210,10 @@ class IntentClassifier:
             return Intent.GENERAL_FINANCE, min(1.0, confidence * 1.3)
         elif trivial_score > 0:
             return Intent.TRIVIAL, min(1.0, confidence * 1.3)
+        elif out_scope_score > 0:
+            return Intent.OUT_OF_SCOPE, min(1.0, confidence * 1.3)
         else:
-            return Intent.GENERAL_FINANCE, 0.35
+            return Intent.OUT_OF_SCOPE, 0.60
     
     def _semantic_classification(self, query_text: str) -> Tuple[Intent, float, Dict[str, float]]:
         """
@@ -210,10 +246,12 @@ class IntentClassifier:
         tax_keyword_score = sum(1 for kw in self.TAX_KEYWORDS if kw in query_lower) / max(len(self.TAX_KEYWORDS), 1)
         finance_keyword_score = sum(1 for kw in self.FINANCE_KEYWORDS if kw in query_lower) / max(len(self.FINANCE_KEYWORDS), 1)
         trivial_keyword_score = sum(1 for kw in self.TRIVIAL_KEYWORDS if kw in query_lower) / max(len(self.TRIVIAL_KEYWORDS), 1)
+        out_scope_keyword_score = sum(1 for kw in self.OUT_OF_SCOPE_KEYWORDS if kw in query_lower) / max(len(self.OUT_OF_SCOPE_KEYWORDS), 1)
         
         scores[Intent.TAX_GROUNDED] = min(1.0, scores[Intent.TAX_GROUNDED] + tax_keyword_score * 0.2)
         scores[Intent.GENERAL_FINANCE] = min(1.0, scores[Intent.GENERAL_FINANCE] + finance_keyword_score * 0.2)
         scores[Intent.TRIVIAL] = min(1.0, scores[Intent.TRIVIAL] + trivial_keyword_score * 0.2)
+        scores[Intent.OUT_OF_SCOPE] = min(1.0, scores[Intent.OUT_OF_SCOPE] + out_scope_keyword_score * 0.25)
         
         # Find best intent
         best_intent = max(scores, key=scores.get)
@@ -267,3 +305,25 @@ class IntentClassifier:
             True if confidence is below threshold
         """
         return confidence < self.MIN_CONFIDENCE_FOR_ROUTING
+
+    def _detect_ambiguity(self, query_lower: str, best_intent: Intent, scores: Dict[Intent, float]) -> Tuple[bool, str]:
+        """Detect whether query needs clarification before routing."""
+        # Clarification is currently only required for vague tax asks.
+        if best_intent != Intent.TAX_GROUNDED:
+            return False, ""
+
+        words = [w for w in query_lower.split() if w]
+        top_scores = sorted(scores.values(), reverse=True)
+        score_gap = top_scores[0] - top_scores[1] if len(top_scores) >= 2 else 1.0
+
+        has_generic_tax_keyword = any(kw in query_lower for kw in self.AMBIGUOUS_TAX_KEYWORDS)
+        has_specific_marker = any(marker in query_lower for marker in self.SPECIFIC_TAX_MARKERS)
+        very_short_query = len(words) <= 6
+
+        if has_generic_tax_keyword and very_short_query and not has_specific_marker:
+            return True, "generic_tax_query"
+
+        if score_gap < 0.12 and very_short_query:
+            return True, "low_intent_separation"
+
+        return False, ""

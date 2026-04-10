@@ -13,11 +13,11 @@ if OPENROUTER_API_KEY:
     OPENROUTER_API_KEY = OPENROUTER_API_KEY.strip()
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 120
 ROUTING_ENABLE_LLM_FALLBACK = os.environ.get("ROUTING_ENABLE_LLM_FALLBACK", "false").strip().lower() == "true"
 
 REASONING_MODEL = "deepseek/deepseek-r1"
-GENERAL_MODEL = "qwen/qwen3-30b-a3b"
+GENERAL_MODEL = "qwen/qwen-2.5-7b-instruct"
 # EMBEDDING_MODEL removed - now using local SentenceTransformer (all-MiniLM-L6-v2)
 # See src/retrieval/embedding_model.py for embedding configuration
 

@@ -52,6 +52,22 @@ class AdversarialClassifier(IAdversarialClassifier):
         "subprocess",
         "how to hack",
         "how to build a bomb",
+        "tax evasion",
+        "evade tax",
+        "evade taxes",
+        "tax fraud",
+        "fake deduction",
+        "fake deductions",
+        "fraudulent deduction",
+        "fraudulent deductions",
+        "hide income",
+        "underreport income",
+        "bypass gst",
+        "bypass gst registration",
+        "illegally avoid gst",
+        "illegal gst avoidance",
+        "black money",
+        "money laundering",
     ]
 
     def __init__(self) -> None:
@@ -117,6 +133,10 @@ class AdversarialClassifier(IAdversarialClassifier):
             "access",
             "steal",
             "leak",
+            "evade",
+            "fraud",
+            "illegal",
+            "launder",
         ]
 
         for keyword in suspicious_keywords:

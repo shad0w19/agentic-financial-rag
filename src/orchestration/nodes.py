@@ -23,6 +23,7 @@ Notes:
 """
 
 import logging
+import time
 from typing import Any, Callable
 
 from src.agents.planner_agent import PlannerAgent
@@ -53,11 +54,13 @@ def run_security(
     Returns:
         Updated GraphState
     """
+    started = time.perf_counter()
     # Check if orchestrator already validated (QueryOrchestrator.run_query)
     precheck_stage = state.metadata.get("gatekeeper_stage")
     if precheck_stage == "orchestrator_pre_routing_passed":
         logger.debug("Security already checked by orchestrator, skipping workflow-level check")
         state.validated_query = state.query
+        state.metadata.setdefault("stage_timings_ms", {})["security"] = (time.perf_counter() - started) * 1000
         return state
     
     try:
@@ -81,6 +84,8 @@ def run_security(
         # On error, we should block the query for safety
         state.metadata["security_blocked"] = True
 
+    state.metadata.setdefault("stage_timings_ms", {})["security"] = (time.perf_counter() - started) * 1000
+
     return state
 
 
@@ -98,6 +103,7 @@ def run_planner(
     Returns:
         Updated GraphState
     """
+    started = time.perf_counter()
     try:
         if not state.validated_query:
             logger.warning("Query not validated, using original")
@@ -113,12 +119,15 @@ def run_planner(
         logger.error(f"Planning error: {e}")
         state.metadata["planning_error"] = str(e)
 
+    state.metadata.setdefault("stage_timings_ms", {})["planner"] = (time.perf_counter() - started) * 1000
+
     return state
 
 
 def run_retrieval(
     state: GraphState,
     retriever: RetrievalAgent,
+    retrieval_k: int = 5,
 ) -> GraphState:
     """
     Run retrieval node.
@@ -130,13 +139,14 @@ def run_retrieval(
     Returns:
         Updated GraphState
     """
+    started = time.perf_counter()
     try:
         if not state.plan:
             logger.warning("No plan available for retrieval")
             return state
 
         query = state.validated_query or state.query
-        results = retriever.execute(query, state.plan, k=5)
+        results = retriever.execute(query, state.plan, k=retrieval_k)
         state.retrieved_docs = results
 
         total_chunks = sum(len(r.chunks) for r in results)
@@ -145,6 +155,8 @@ def run_retrieval(
     except Exception as e:
         logger.error(f"Retrieval error: {e}")
         state.metadata["retrieval_error"] = str(e)
+
+    state.metadata.setdefault("stage_timings_ms", {})["retrieval"] = (time.perf_counter() - started) * 1000
 
     return state
 
@@ -163,6 +175,7 @@ def run_reasoning(
     Returns:
         Updated GraphState
     """
+    started = time.perf_counter()
     try:
         if not state.retrieved_docs:
             logger.warning("No retrieved documents for reasoning")
@@ -183,6 +196,8 @@ def run_reasoning(
         state.metadata["reasoning_error"] = str(e)
         state.answer = "Error generating answer."
 
+    state.metadata.setdefault("stage_timings_ms", {})["reasoning"] = (time.perf_counter() - started) * 1000
+
     return state
 
 
@@ -200,6 +215,7 @@ def run_verification(
     Returns:
         Updated GraphState
     """
+    started = time.perf_counter()
     try:
         if not state.answer:
             logger.warning("No answer to verify")
@@ -211,6 +227,9 @@ def run_verification(
             plan=state.plan or [],
         )
         state.verification = result
+        verification_debug = result.get("debug") if isinstance(result, dict) else None
+        if isinstance(verification_debug, dict):
+            state.metadata["verification_debug"] = verification_debug
 
         if result["is_valid"]:
             logger.info(f"Answer verified (confidence: {result['confidence']:.2f})")
@@ -220,5 +239,7 @@ def run_verification(
     except Exception as e:
         logger.error(f"Verification error: {e}")
         state.metadata["verification_error"] = str(e)
+
+    state.metadata.setdefault("stage_timings_ms", {})["verification"] = (time.perf_counter() - started) * 1000
 
     return state

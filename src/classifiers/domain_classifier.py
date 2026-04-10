@@ -29,6 +29,8 @@ class Domain(Enum):
     PERSONAL_TAX = "personal_tax"       # Individual income tax
     CORPORATE_TAX = "corporate_tax"     # Business/corporate tax
     GST = "gst"                         # GST/indirect tax
+    INVESTMENT = "investment"           # Investments and portfolio planning
+    REGULATORY = "regulatory"           # Compliance, FEMA, SEBI, DTAA
     MULTI = "multi"                     # Spans multiple domains OR fallback
 
 
@@ -99,6 +101,36 @@ class DomainClassifier:
                 "invoice", "billing", "supply", "registration",
             },
             "patterns": ["gst", "tax rate", "input credit", "hsn", "sac"]
+        },
+        Domain.INVESTMENT: {
+            "templates": [
+                "Investment planning and portfolio strategy",
+                "Mutual funds, SIP, stocks, bonds, and ETFs",
+                "Retirement corpus and wealth accumulation",
+                "Risk profile, diversification, and asset allocation",
+                "Returns, compounding, and long-term investing",
+            ],
+            "keywords": {
+                "investment", "mutual fund", "sip", "stp", "swp", "stock", "equity",
+                "bond", "etf", "portfolio", "asset allocation", "risk", "return",
+                "retirement", "nps", "ppf", "epf", "ulip", "scss", "reit", "invit",
+            },
+            "patterns": ["investment", "mutual fund", "sip", "portfolio", "retirement", "stock"]
+        },
+        Domain.REGULATORY: {
+            "templates": [
+                "Financial regulations and compliance in India",
+                "SEBI, FEMA, and DTAA interpretation",
+                "Regulatory filing and disclosure obligations",
+                "Cross-border remittance and LRS compliance",
+                "Circulars, notifications, and legal compliance rules",
+            ],
+            "keywords": {
+                "sebi", "fema", "dtaa", "lrs", "fatca", "schedule fa", "compliance",
+                "regulatory", "circular", "notification", "rbi", "cbic", "cbdt",
+                "foreign remittance", "nre", "nro", "fcnr", "vda", "crypto", "194s",
+            },
+            "patterns": ["sebi", "fema", "dtaa", "compliance", "regulatory", "lrs"]
         }
     }
     
@@ -106,6 +138,7 @@ class DomainClassifier:
     MIN_DOMAIN_CONFIDENCE = 0.40       # Minimum to include domain in detection
     MULTI_DOMAIN_THRESHOLD = 2         # Number of domains above threshold → multi
     PRIMARY_DOMAIN_WIN_MARGIN = 0.15   # Gap needed to pick one vs multi
+    LOW_CONFIDENCE_FANOUT_THRESHOLD = 0.55
     
     def __init__(self):
         """Initialize domain classifier."""
@@ -141,15 +174,28 @@ class DomainClassifier:
             if score >= self.MIN_DOMAIN_CONFIDENCE
         ]
         
-        is_multi_domain = len(detected_domains) >= self.MULTI_DOMAIN_THRESHOLD
+        sorted_domains = sorted(
+            combined_scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        top_domain, top_score = sorted_domains[0]
+        second_score = sorted_domains[1][1] if len(sorted_domains) > 1 else 0.0
+        score_gap = top_score - second_score
+
+        is_multi_domain = (
+            len(detected_domains) >= self.MULTI_DOMAIN_THRESHOLD
+            and top_score < self.LOW_CONFIDENCE_FANOUT_THRESHOLD
+            and score_gap < self.PRIMARY_DOMAIN_WIN_MARGIN
+        )
         
         # Step 5: Determine primary domain
         if is_multi_domain:
             primary_domain = Domain.MULTI
             primary_confidence = sum(combined_scores.values()) / len(combined_scores)
         else:
-            primary_domain = max(combined_scores, key=combined_scores.get)
-            primary_confidence = combined_scores[primary_domain]
+            primary_domain = top_domain
+            primary_confidence = top_score
         
         self.logger.debug(
             f"Domain classification: {primary_domain} ({primary_confidence:.2f}) | "
@@ -238,7 +284,7 @@ class DomainClassifier:
                 return [classification.primary_domain]
             else:
                 # Fallback: query all domains
-                return [Domain.PERSONAL_TAX, Domain.CORPORATE_TAX, Domain.GST]
+                return list(self.DOMAIN_INDICATORS.keys())
     
     def should_use_fallback(self, confidence: float) -> bool:
         """

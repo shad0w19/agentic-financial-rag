@@ -25,6 +25,7 @@ Notes:
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from langchain_openai import ChatOpenAI
@@ -73,9 +74,29 @@ class FederatedRouter(IRetriever):
         
         # Domain keywords for fallback detection
         self.domain_keywords = {
-            DocumentSource.PERSONAL_TAX: ["income tax", "itr", "salary", "individual", "personal", "income", "ppf", "80c", "deduction", "hra"],
-            DocumentSource.CORPORATE_TAX: ["corporate tax", "company", "business", "corporation", "corporate"],
-            DocumentSource.GST: ["gst", "goods", "services", "supply"],
+            DocumentSource.PERSONAL_TAX: [
+                "income tax", "itr", "salary", "individual", "personal", "income", "ppf",
+                "80c", "80d", "deduction", "hra", "home loan", "capital gains", "section 24",
+                "tds", "form 16", "advance tax",
+            ],
+            DocumentSource.CORPORATE_TAX: [
+                "corporate tax", "company", "business", "corporation", "corporate", "firm",
+                "llp", "professional tax", "tds", "tax audit",
+            ],
+            DocumentSource.GST: [
+                "gst", "goods", "services", "supply", "real estate", "property", "immovable",
+                "works contract", "itc", "input tax credit", "rera",
+            ],
+            DocumentSource.INVESTMENT: [
+                "investment", "mutual fund", "sip", "stp", "swp", "stock", "equity",
+                "bond", "etf", "portfolio", "asset allocation", "return", "risk",
+                "retirement", "nps", "ppf", "epf", "ulip", "reit", "invit",
+            ],
+            DocumentSource.REGULATORY: [
+                "regulatory", "compliance", "sebi", "fema", "dtaa", "lrs", "rbi",
+                "cbdt", "cbic", "circular", "notification", "fatca", "schedule fa",
+                "vda", "crypto", "194s", "nre", "nro", "fcnr",
+            ],
         }
         
         self.logger = logging.getLogger(__name__)
@@ -122,8 +143,8 @@ class FederatedRouter(IRetriever):
             try:
                 system_prompt = """You are a financial query classifier.
 Analyze the query and return ONLY a JSON list of relevant tax domains.
-Domains: ["personal_tax", "corporate_tax", "gst"]
-Return EXACTLY this format: ["personal_tax"] or ["corporate_tax", "gst"]
+Domains: ["personal_tax", "corporate_tax", "gst", "investment", "regulatory"]
+Return EXACTLY this format: ["personal_tax"] or ["investment", "regulatory"]
 Do NOT include explanations."""
 
                 prompt = f"Query: {query}\n\nReturn JSON domains list:"
@@ -243,6 +264,7 @@ Do NOT include explanations."""
         
         if confident_domains:
             self.logger.info(f"✅ Keyword routing (confident): {confident_domains}")
+            confident_domains = self._expand_domains_for_recall(confident_domains, query)
             # Cache result
             self.routing_cache[query_hash] = confident_domains
             return confident_domains, True
@@ -258,11 +280,46 @@ Do NOT include explanations."""
         llm_domains = [domain for domain in llm_domains if domain in self.available_sources]
         if not llm_domains:
             llm_domains = self.available_sources or list(self.domain_keywords.keys())
+        llm_domains = self._expand_domains_for_recall(llm_domains, query)
         
         # Cache result
         self.routing_cache[query_hash] = llm_domains
         
         return llm_domains, False
+
+    def _expand_domains_for_recall(
+        self,
+        detected_domains: List[DocumentSource],
+        query: str,
+    ) -> List[DocumentSource]:
+        """Expand routed domains for known cross-domain tax intents to avoid retrieval misses."""
+        if not detected_domains:
+            return detected_domains
+
+        query_lower = (query or "").lower()
+        expanded = list(detected_domains)
+
+        def add_domain(source: DocumentSource) -> None:
+            if source in self.available_sources and source not in expanded:
+                expanded.append(source)
+
+        # GST + property/real-estate queries often require both GST and income-tax context.
+        if ("gst" in query_lower) and any(
+            marker in query_lower for marker in ("real estate", "property", "immovable", "construction")
+        ):
+            add_domain(DocumentSource.PERSONAL_TAX)
+            add_domain(DocumentSource.CORPORATE_TAX)
+
+        # TDS queries can sit in both personal and corporate contexts.
+        if "tds" in query_lower:
+            add_domain(DocumentSource.PERSONAL_TAX)
+            add_domain(DocumentSource.CORPORATE_TAX)
+
+        # Home-loan and capital-gains queries are primarily personal tax but may mention GST context.
+        if any(marker in query_lower for marker in ("home loan", "capital gains", "section 24", "house property")):
+            add_domain(DocumentSource.PERSONAL_TAX)
+
+        return expanded
 
     def preload_all_retrievers(self) -> None:
         """
@@ -368,27 +425,61 @@ Do NOT include explanations."""
         query: str,
         k: int = 5,
         filters: Dict[str, Any] | None = None,
+        domain_hint: Optional[str] = None,
     ) -> RetrievalResult:
         """
         Main search entry point: hybrid route → load retrievers → search.
         Uses keyword-first routing (binary confidence) with LLM fallback.
         Implements IRetriever.search()
-        
+
         Args:
             query: Search query
             k: Number of results
             filters: Optional filters (unused for federated)
-        
+            domain_hint: Domain already classified upstream (skips route_hybrid when provided)
+
         Returns:
             Combined RetrievalResult from all detected domains
         """
         if not query:
             raise ValueError("Query cannot be empty")
 
-        # Use hybrid routing (keyword-first with LLM fallback)
-        detected_domains, is_confident = self.route_hybrid(query)
-        routing_method = "keyword" if is_confident else "LLM"
-        self.logger.info(f"🔍 Query: '{query}' → {routing_method} routing: {[d.value for d in detected_domains]}")
+        # If domain_hint is provided by upstream classifier, use it directly —
+        # skips route_hybrid() (and any possible LLM detection) entirely.
+        if domain_hint:
+            try:
+                source = DocumentSource(domain_hint)
+                if source in self.available_sources:
+                    detected_domains = self._expand_domains_for_recall([source], query)
+                    self.logger.info(
+                        "🔍 Query: '%s' → domain_hint routing: %s (skipped route_hybrid)",
+                        query[:60],
+                        [d.value for d in detected_domains],
+                    )
+                else:
+                    detected_domains, is_confident = self.route_hybrid(query)
+                    routing_method = "keyword" if is_confident else "LLM"
+                    self.logger.info(
+                        "🔍 Query: '%s' → %s routing (hint '%s' not indexed): %s",
+                        query[:60], routing_method, domain_hint,
+                        [d.value for d in detected_domains],
+                    )
+            except ValueError:
+                detected_domains, is_confident = self.route_hybrid(query)
+                routing_method = "keyword" if is_confident else "LLM"
+                self.logger.info(
+                    "🔍 Query: '%s' → %s routing (invalid hint '%s'): %s",
+                    query[:60], routing_method, domain_hint,
+                    [d.value for d in detected_domains],
+                )
+        else:
+            # Use hybrid routing (keyword-first with LLM fallback)
+            detected_domains, is_confident = self.route_hybrid(query)
+            routing_method = "keyword" if is_confident else "LLM"
+            self.logger.info(
+                "🔍 Query: '%s' → %s routing: %s",
+                query[:60], routing_method, [d.value for d in detected_domains],
+            )
 
         # Load retrievers and search
         results = []
@@ -496,22 +587,70 @@ Do NOT include explanations."""
                 query_used=query,
             )
 
-        all_chunks = []
-        all_scores = []
+        # Build scored tuples and keep best chunk per source first for cross-domain coverage.
+        query_terms = {
+            token
+            for token in re.findall(r"[a-zA-Z0-9]+", (query or "").lower())
+            if len(token) > 2 and token not in {"what", "how", "the", "for", "and", "with", "tax"}
+        }
 
+        def lexical_boost(text: str) -> float:
+            if not query_terms:
+                return 0.0
+            haystack = (text or "").lower()
+            overlap = sum(1 for t in query_terms if t in haystack)
+            if overlap <= 0:
+                return 0.0
+            # Keep lexical signal small but meaningful against weak cross-encoder scores.
+            return min(0.35, 0.08 * overlap)
+
+        scored_items: List[tuple] = []
         for result in results:
-            all_chunks.extend(result.chunks)
-            all_scores.extend(result.scores)
+            scores = result.scores or []
+            for idx, chunk in enumerate(result.chunks):
+                base_score = scores[idx] if idx < len(scores) else 0.0
+                score = float(base_score) + lexical_boost(getattr(chunk, "text", ""))
+                scored_items.append((chunk, score))
 
-        # Sort by score descending
-        combined = sorted(
-            zip(all_chunks, all_scores),
-            key=lambda x: x[1],
-            reverse=True,
-        )
+        if not scored_items:
+            return RetrievalResult(
+                chunks=[],
+                strategy_used=RetrievalStrategy.HYBRID,
+                scores=[],
+                query_used=query,
+            )
 
-        top_chunks = [chunk for chunk, _ in combined[:k]]
-        top_scores = [score for _, score in combined[:k]]
+        scored_items.sort(key=lambda x: x[1], reverse=True)
+
+        selected: List[tuple] = []
+        seen_chunk_ids = set()
+
+        # Pass 1: include one top chunk per source (if possible) to reduce single-domain collapse.
+        seen_sources = set()
+        for chunk, score in scored_items:
+            if chunk.chunk_id in seen_chunk_ids:
+                continue
+            source_key = chunk.source.value
+            if source_key in seen_sources:
+                continue
+            selected.append((chunk, score))
+            seen_sources.add(source_key)
+            seen_chunk_ids.add(chunk.chunk_id)
+            if len(selected) >= k:
+                break
+
+        # Pass 2: fill remaining slots by global score.
+        if len(selected) < k:
+            for chunk, score in scored_items:
+                if chunk.chunk_id in seen_chunk_ids:
+                    continue
+                selected.append((chunk, score))
+                seen_chunk_ids.add(chunk.chunk_id)
+                if len(selected) >= k:
+                    break
+
+        top_chunks = [chunk for chunk, _ in selected[:k]]
+        top_scores = [score for _, score in selected[:k]]
 
         return RetrievalResult(
             chunks=top_chunks,

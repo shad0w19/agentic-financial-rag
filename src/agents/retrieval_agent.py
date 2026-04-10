@@ -39,6 +39,9 @@ class RetrievalAgent:
     Supports sequential (default) and parallel (Phase D Tier 2) retrieval.
     """
 
+    MAX_CHUNKS_PER_RESULT = 4
+    LOW_CONFIDENCE_PARALLEL_THRESHOLD = 0.55
+
     def __init__(
         self,
         retriever: IRetriever,
@@ -112,6 +115,24 @@ class RetrievalAgent:
                     result = self._execute_parallel_retrieval(query_text, k)
                 else:
                     result = self._execute_sequential_retrieval(query_text, k)
+
+                # Phase 1.5: Cap chunk volume per retrieval step for bounded downstream latency.
+                if result and result.chunks:
+                    original_chunks = len(result.chunks)
+                    if original_chunks > self.MAX_CHUNKS_PER_RESULT:
+                        capped_chunks = result.chunks[:self.MAX_CHUNKS_PER_RESULT]
+                        capped_scores = (result.scores or [])[:self.MAX_CHUNKS_PER_RESULT]
+                        result = RetrievalResult(
+                            chunks=capped_chunks,
+                            strategy_used=result.strategy_used,
+                            scores=capped_scores,
+                            query_used=result.query_used,
+                        )
+                        self.logger.info(
+                            "Capped retrieval chunks from %d to %d",
+                            original_chunks,
+                            len(capped_chunks),
+                        )
                 
                 results.append(result)
 
@@ -157,15 +178,9 @@ class RetrievalAgent:
         # Classify query domain
         try:
             domain_class = self.domain_classifier.classify(query)
-            
-            # Use parallel if multi-domain or low confidence
-            is_multi_domain = domain_class.is_multi_domain
-            is_low_confidence = domain_class.confidence < 0.7
-            
-            if is_multi_domain:
-                self.logger.debug(f"Multi-domain detected: {[d.value for d in domain_class.domains_detected]}")
-                return True
-            
+
+            # Phase 1.5: Avoid multi-domain fanout unless confidence is genuinely low.
+            is_low_confidence = domain_class.confidence < self.LOW_CONFIDENCE_PARALLEL_THRESHOLD
             if is_low_confidence:
                 self.logger.debug(f"Low confidence ({domain_class.confidence:.2f}), using parallel for coverage")
                 return True
@@ -187,11 +202,18 @@ class RetrievalAgent:
             return self._execute_sequential_retrieval(query, k)
         
         try:
+            domain_hint = None
+            if self.domain_classifier:
+                domain_class = self.domain_classifier.classify(query)
+                if domain_class and domain_class.primary_domain != Domain.MULTI:
+                    domain_hint = domain_class.primary_domain.value
+
             # Phase D: Use parallel retriever for multi-domain coverage
             result = self.parallel_retriever.search(
                 query=query,
                 k=k,
-                force_parallel=True,
+                domain_hint=domain_hint,
+                force_parallel=False,
             )
             self.logger.debug(f"Parallel retrieval retrieved {len(result.chunks)} chunks")
             return result

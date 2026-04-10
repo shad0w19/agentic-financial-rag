@@ -20,6 +20,7 @@ Notes:
 
 import json
 import logging
+import re
 from typing import Any, Callable, Dict, List
 
 from src.import_map import PlanStep, Query
@@ -128,13 +129,7 @@ Return ONLY valid JSON array, no other text."""
             # Parse JSON response
             try:
                 # Clean JSON response
-                json_str = response.strip()
-                if json_str.startswith("```"):
-                    # Remove markdown code blocks if present
-                    json_str = json_str.split("```")[1]
-                    if json_str.startswith("json"):
-                        json_str = json_str[4:]
-                    json_str = json_str.strip()
+                json_str = self._extract_json_payload(response)
                 
                 logger.debug(f"[PLANNER] Cleaned JSON (first 300 chars): {json_str[:300]}")
                 steps_data = json.loads(json_str)
@@ -198,6 +193,25 @@ Return ONLY valid JSON array, no other text."""
         except Exception as e:
             logger.error(f"LLM planning error: {e}")
             return self._generate_fallback_plan(query_text)
+
+    def _extract_json_payload(self, response: str) -> str:
+        """Extract valid JSON array from model output with defensive cleanup."""
+        json_str = (response or "").strip()
+
+        # Remove model reasoning tags if present (for models that emit <think> blocks).
+        json_str = re.sub(r"<think>.*?</think>", "", json_str, flags=re.IGNORECASE | re.DOTALL).strip()
+
+        if json_str.startswith("```"):
+            fence_match = re.search(r"```(?:json)?\s*(.*?)```", json_str, flags=re.IGNORECASE | re.DOTALL)
+            if fence_match:
+                json_str = fence_match.group(1).strip()
+
+        if not json_str.startswith("["):
+            array_match = re.search(r"\[.*\]", json_str, flags=re.DOTALL)
+            if array_match:
+                json_str = array_match.group(0).strip()
+
+        return json_str
 
     def _generate_fallback_plan(self, query_text: str) -> List[PlanStep]:
         """Generate fallback rule-based plan."""
@@ -320,4 +334,56 @@ Return ONLY valid JSON array, no other text."""
                 }
                 for step in plan
             ],
+        }
+    
+    def validate_plan_quality(self, plan: List[PlanStep]) -> Dict[str, Any]:
+        """
+        Phase 2: Validate plan quality to catch degenerate fallback plans.
+        
+        Ensures plan has essential steps and is not malformed.
+        
+        Args:
+            plan: List of PlanStep objects
+        
+        Returns:
+            Dict with is_valid (bool), issues (List[str]), metrics (Dict)
+        """
+        issues: List[str] = []
+        action_types = [step.action_type for step in plan]
+        
+        # Check for essential steps
+        if "security" not in action_types:
+            issues.append("Missing security step")
+        
+        if "retrieval" not in action_types:
+            issues.append("Missing retrieval step")
+        
+        if "reasoning" not in action_types:
+            issues.append("Missing reasoning step")
+        
+        # Check plan length
+        if len(plan) < 3:
+            issues.append(f"Plan too short: {len(plan)} steps (expected >= 3)")
+        
+        if len(plan) > 10:
+            issues.append(f"Plan too long: {len(plan)} steps (expected <= 10)")
+        
+        # Check for step structure
+        for i, step in enumerate(plan):
+            if not step.step_id:
+                issues.append(f"Step {i} has no step_id")
+            if not step.action_type:
+                issues.append(f"Step {i} has no action_type")
+        
+        return {
+            "is_valid": len(issues) == 0,
+            "issues": issues,
+            "metrics": {
+                "plan_length": len(plan),
+                "has_security": "security" in action_types,
+                "has_retrieval": "retrieval" in action_types,
+                "has_reasoning": "reasoning" in action_types,
+                "has_verification": "verification" in action_types,
+                "action_types": action_types,
+            }
         }

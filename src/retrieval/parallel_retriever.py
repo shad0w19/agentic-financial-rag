@@ -63,7 +63,9 @@ class ParallelRetriever:
     """
     
     RETRIEVAL_TIMEOUT = 5.0  # Max time per domain retriever
-    MAX_WORKERS = 3          # Max parallel threads (3 domains)
+    MAX_WORKERS = 5          # Max parallel threads (5 domains)
+    MAX_RERANK_CANDIDATES = 20
+    MAX_POST_RERANK_K = 3
     
     def __init__(
         self,
@@ -71,6 +73,8 @@ class ParallelRetriever:
         personal_tax_retriever: IRetriever,
         corporate_tax_retriever: IRetriever,
         gst_retriever: IRetriever,
+        investment_retriever: Optional[IRetriever] = None,
+        regulatory_retriever: Optional[IRetriever] = None,
         reranker=None,  # Optional reranker for result merging
     ):
         """
@@ -89,6 +93,10 @@ class ParallelRetriever:
             Domain.CORPORATE_TAX: corporate_tax_retriever,
             Domain.GST: gst_retriever,
         }
+        if investment_retriever is not None:
+            self.retrievers[Domain.INVESTMENT] = investment_retriever
+        if regulatory_retriever is not None:
+            self.retrievers[Domain.REGULATORY] = regulatory_retriever
         self.reranker = reranker
         self.logger = logging.getLogger(__name__)
     
@@ -147,7 +155,7 @@ class ParallelRetriever:
         force_parallel: bool,
     ) -> List[Domain]:
         """Determine which domains to query."""
-        domains = domain_classification.domains_detected
+        domains = [d for d in domain_classification.domains_detected if d in self.retrievers]
         
         if domain_hint and not force_parallel:
             # Respect domain hint if provided
@@ -155,12 +163,20 @@ class ParallelRetriever:
             if hint_domain:
                 return [hint_domain]
         
-        if domain_classification.is_multi_domain or force_parallel:
-            # Multi-domain or forced: return all detected domains
-            return domains or [domain_classification.primary_domain]
+        if force_parallel:
+            # Explicit override for benchmarking/debug usage.
+            fallback_domain = domain_classification.primary_domain if domain_classification.primary_domain in self.retrievers else None
+            return domains or ([fallback_domain] if fallback_domain else [])
+
+        # Phase 1.5: Avoid broad fanout unless confidence is low.
+        if domain_classification.is_multi_domain and domain_classification.confidence < 0.55:
+            fallback_domain = domain_classification.primary_domain if domain_classification.primary_domain in self.retrievers else None
+            return domains or ([fallback_domain] if fallback_domain else [])
         
         # Single domain: return primary only
-        return [domain_classification.primary_domain]
+        if domain_classification.primary_domain in self.retrievers:
+            return [domain_classification.primary_domain]
+        return domains[:1]
     
     def _parse_domain_hint(self, hint: str) -> Optional[Domain]:
         """Parse domain hint string to Domain enum."""
@@ -171,6 +187,10 @@ class ParallelRetriever:
             return Domain.CORPORATE_TAX
         elif "gst" in hint_lower:
             return Domain.GST
+        elif "invest" in hint_lower or "portfolio" in hint_lower:
+            return Domain.INVESTMENT
+        elif "regulat" in hint_lower or "compliance" in hint_lower or "fema" in hint_lower or "sebi" in hint_lower:
+            return Domain.REGULATORY
         return None
     
     def _sequential_search(
@@ -274,10 +294,18 @@ class ParallelRetriever:
         
         # Step 3: Rerank merged results if reranker available
         if self.reranker and all_chunks:
+            if len(all_chunks) > self.MAX_RERANK_CANDIDATES:
+                self.logger.warning(
+                    "Capping reranker candidates from %d to %d",
+                    len(all_chunks),
+                    self.MAX_RERANK_CANDIDATES,
+                )
+                all_chunks = all_chunks[:self.MAX_RERANK_CANDIDATES]
             all_chunks = self._rerank_results(query, all_chunks)
         
         # Step 4: Select top-k
-        top_chunks = all_chunks[:k]
+        selected_k = min(k, self.MAX_POST_RERANK_K) if self.reranker else k
+        top_chunks = all_chunks[:selected_k]
         
         # Step 5: Create result
         from datetime import datetime
@@ -306,16 +334,13 @@ class ParallelRetriever:
             return chunks
         
         try:
-            # Reranker scores chunks
             reranked = self.reranker.rerank(query, chunks)
-            # Sort by relevance score descending
-            reranked_sorted = sorted(
-                reranked,
-                key=lambda x: x.get("score", 0),
-                reverse=True,
-            )
-            # Extract chunks in sorted order
-            return [chunk for chunk, score in reranked_sorted]
+            if isinstance(reranked, tuple) and len(reranked) == 2:
+                reranked_chunks, _ = reranked
+                return reranked_chunks
+            if isinstance(reranked, list):
+                return reranked
+            return chunks
         except Exception as e:
             logger.warning(f"Reranking failed: {e}. Returning original order.")
             return chunks

@@ -34,6 +34,7 @@ class InputValidator(ISecurityValidator):
     MAX_QUERY_LENGTH = 10000
     MIN_QUERY_LENGTH = 3
     INVALID_CHARS = ["\x00", "\x01", "\x02", "\x03"]
+    SHORT_TRIVIAL_ALLOWLIST = {"hi", "hey", "yo", "ok"}
 
     def __init__(self) -> None:
         """Initialize input validator."""
@@ -55,6 +56,17 @@ class InputValidator(ISecurityValidator):
                 threat_detected="empty_query",
                 confidence=1.0,
                 details={"reason": "Query text is empty"},
+            )
+
+        query_text = (query.text or "").strip().lower()
+
+        # Allow short trivial greetings to pass security and route normally.
+        if query_text in self.SHORT_TRIVIAL_ALLOWLIST:
+            return SecurityCheckResult(
+                passed=True,
+                threat_detected=None,
+                confidence=1.0,
+                details={"check": "input_validation_short_trivial_allowlist"},
             )
 
         if len(query.text) < self.MIN_QUERY_LENGTH:

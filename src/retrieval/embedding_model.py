@@ -22,6 +22,12 @@ Notes:
 import logging
 from typing import List
 
+try:
+    import torch
+    CUDA_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    CUDA_AVAILABLE = False
+
 from sentence_transformers import SentenceTransformer
 
 from src.import_map import IEmbeddingModel
@@ -46,13 +52,15 @@ class EmbeddingModel(IEmbeddingModel):
             model_name: HuggingFace model identifier
         """
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name)
+        device = "cuda" if CUDA_AVAILABLE else "cpu"
+        self.model = SentenceTransformer(model_name, device=device)
         self.cache = {}  # Cache for embedding results
         self.dimension = 384  # MiniLM always outputs 384-dim vectors
         
         logger.info(f"Initialized SentenceTransformer Model: {model_name}")
+        logger.info(f"Device: {device}")
         logger.info(f"Embedding dimension: {self.dimension}")
-        logger.info(f"Model ready for high-throughput batching (~2000+ sentences/sec)")
+        logger.info(f"Model ready for high-throughput batching (~2000+ sentences/sec on {device})")
 
     def embed_text(self, text: str) -> List[float]:
         """

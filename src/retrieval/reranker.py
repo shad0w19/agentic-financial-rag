@@ -41,6 +41,8 @@ class Reranker:
     Reranks retrieval results using cross-encoder.
     """
 
+    MAX_RERANK_INPUT = 8
+
     def __init__(
         self,
         model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
@@ -61,6 +63,8 @@ class Reranker:
         try:
             # Determine device
             device = "cuda" if CUDA_AVAILABLE else "cpu"
+
+            self.logger.info(f"[RERANK] Using device: {device}")
             
             self.model = CrossEncoder(self.model_name, device=device)
             
@@ -97,11 +101,22 @@ class Reranker:
             raise RuntimeError("Model not loaded")
 
         try:
+            original_count = len(chunks)
+            if original_count > 20:
+                self.logger.warning(
+                    f"[RERANK] High input volume: {original_count} chunks; consider reducing retrieval fan-out"
+                )
+
+            chunks = chunks[:self.MAX_RERANK_INPUT]
+            self.logger.info(
+                f"[RERANK] Input chunks before scoring: {len(chunks)} (from {original_count})"
+            )
+
             # Prepare pairs
             pairs = [(query, chunk.text) for chunk in chunks]
 
             # Score
-            scores = self.model.predict(pairs)
+            scores = self.model.predict(pairs, batch_size=8)
 
             # Sort by score
             ranked = sorted(
@@ -112,6 +127,8 @@ class Reranker:
 
             if top_k:
                 ranked = ranked[:top_k]
+
+            self.logger.info(f"[RERANK] Returning top {len(ranked)} chunks after rerank")
 
             reranked_chunks = [chunk for chunk, _ in ranked]
             reranked_scores = [float(score) for _, score in ranked]

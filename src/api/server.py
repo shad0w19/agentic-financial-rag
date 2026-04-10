@@ -13,6 +13,7 @@ from src.orchestration.workflow import AgentWorkflow
 from src.security.security_gatekeeper import SecurityGatekeeper
 from src.retrieval.federated_router import FederatedRouter
 from src.retrieval.embedding_model import EmbeddingModel
+from src.retrieval.reranker import Reranker
 from src.retrieval.parallel_retriever import ParallelRetriever  # Phase D Tier 2
 from src.import_map import DomainClassifier, Domain  # Phase D Tier 2
 from src.data_pipeline.dataset_builder import DatasetBuilder
@@ -26,6 +27,7 @@ from src.config.settings import (
 
 logger = logging.getLogger(__name__)
 _workflow_instance: AgentWorkflow | None = None
+_workflow_warmed = False
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -62,6 +64,7 @@ def _get_reasoning_llm() -> ChatOpenAI:
         openai_api_base=OPENROUTER_BASE_URL,
         temperature=0,  # Deterministic reasoning
         timeout=DEFAULT_TIMEOUT,
+        max_tokens=1800,  # Allow more detailed reasoning and complete answers
     )
 
 
@@ -136,6 +139,13 @@ def initialize_workflow() -> AgentWorkflow:
     # Phase D Tier 2: Initialize ParallelRetriever for multi-domain queries
     domain_classifier = DomainClassifier()
     parallel_retriever = None
+    reranker = None
+
+    try:
+        reranker = Reranker(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
+        logger.info("✅ Reranker initialized for retrieval merge")
+    except Exception as e:
+        logger.warning(f"⚠️  Reranker initialization failed: {e}. Continuing without reranker.")
     
     try:
         # For Phase D Tier 2: Use the router itself as domain-specific retrievers
@@ -147,7 +157,9 @@ def initialize_workflow() -> AgentWorkflow:
                 personal_tax_retriever=router,  # Use router for all domains
                 corporate_tax_retriever=router,
                 gst_retriever=router,
-                reranker=None,  # Can be added in future (CrossEncoder)
+                investment_retriever=router,
+                regulatory_retriever=router,
+                reranker=reranker,
             )
             logger.info("✅ ParallelRetriever initialized (Phase D Tier 2)")
         else:
@@ -190,11 +202,30 @@ def initialize_workflow() -> AgentWorkflow:
     return workflow
 
 
+def _warmup_workflow(workflow: AgentWorkflow) -> None:
+    """One-time preload/warmup to reduce first-query latency spikes."""
+    global _workflow_warmed
+    if _workflow_warmed:
+        return
+
+    try:
+        router = getattr(workflow, "router", None)
+        if router and hasattr(router, "preload_all_retrievers"):
+            router.preload_all_retrievers()
+        if hasattr(workflow, "retriever") and getattr(workflow.retriever, "domain_classifier", None):
+            workflow.retriever.domain_classifier.classify("income tax slab and GST threshold")
+        _workflow_warmed = True
+        logger.info("✅ Workflow warmup completed")
+    except Exception as exc:
+        logger.warning(f"Workflow warmup skipped due to error: {exc}")
+
+
 def get_workflow() -> AgentWorkflow:
     """Lazy workflow initialization to avoid heavy import-time side effects."""
     global _workflow_instance
     if _workflow_instance is None:
         _workflow_instance = initialize_workflow()
+    _warmup_workflow(_workflow_instance)
     return _workflow_instance
 
 

@@ -89,7 +89,33 @@ class SecurityGatekeeper(ISecurityGatekeeper):
         "subprocess",
         "how to hack",
         "how to build a bomb",
+        "i will kill",
+        "i'll kill",
+        "ill kill",
+        "kill you",
+        "murder you",
+        "shoot you",
+        "harm you",
+        "hurt you",
+        "tax evasion",
+        "evade tax",
+        "evade taxes",
+        "tax fraud",
+        "fake deduction",
+        "fake deductions",
+        "fraudulent deduction",
+        "fraudulent deductions",
+        "hide income",
+        "underreport income",
+        "bypass gst",
+        "bypass gst registration",
+        "illegally avoid gst",
+        "illegal gst avoidance",
+        "black money",
+        "money laundering",
     ]
+
+    SHORT_TRIVIAL_ALLOWLIST = {"hi", "hey", "yo", "ok"}
 
     def __init__(self, log_path: str = "logs/audit_log.json") -> None:
         """
@@ -182,6 +208,17 @@ class SecurityGatekeeper(ISecurityGatekeeper):
                 threat_detected="empty_query",
                 confidence=1.0,
                 details={"reason": "Query text is empty"},
+            )
+
+        query_text = (query.text or "").strip().lower()
+
+        # Allow short greetings so they route to the trivial lane.
+        if query_text in self.SHORT_TRIVIAL_ALLOWLIST:
+            return SecurityCheckResult(
+                passed=True,
+                threat_detected=None,
+                confidence=1.0,
+                details={"check": "input_validation_short_trivial_allowlist"},
             )
 
         if len(query.text) > 10000:

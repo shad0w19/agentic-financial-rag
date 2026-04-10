@@ -20,7 +20,7 @@ Notes:
 
 import logging
 import re
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from src.import_map import PlanStep, RetrievalResult
 
@@ -81,11 +81,24 @@ class VerificationAgent:
         Returns:
             Verification result dict
         """
-        # Create context from retrieved docs
+        # Build verification context and lightweight input metrics for diagnostics.
         context = "\n".join(
             [chunk.text for r in retrieved_docs for chunk in r.chunks]
             if retrieved_docs else []
         )
+        verification_debug = {
+            "verification_input_chars": len(context),
+            "verification_answer_chars": len(answer or ""),
+            "verification_retrieved_chunk_count": sum(len(r.chunks) for r in (retrieved_docs or [])),
+            "verification_estimated_claim_count": len(self._extract_claims(answer or "")),
+        }
+
+        # Fast-path special handling for "Information not found" answers.
+        if (answer or "").strip().lower().startswith("information not found"):
+            return self._verify_not_found_answer(retrieved_docs, debug=verification_debug)
+
+        if (answer or "").strip().startswith("I found relevant information in the retrieved documents:"):
+            return self._verify_evidence_summary_answer(retrieved_docs, debug=verification_debug)
 
         # Create verification prompt
         verification_prompt = f"""You are a financial answer verifier. Check if this answer is correct and grounded in the context.
@@ -128,34 +141,35 @@ Respond with JSON:
                 confidence = float(result.get("confidence", 50)) / 100.0
                 issues = result.get("issues", [])
                 
-                return self._format_result(is_valid, issues, confidence)
+                return self._format_result(is_valid, issues, confidence, debug=verification_debug)
                 
             except (json.JSONDecodeError, ValueError) as e:
                 logger.debug(f"Could not parse verification JSON: {e}, using fallback")
-                return self._rule_based_verify(answer, retrieved_docs)
+                return self._rule_based_verify(answer, retrieved_docs, debug=verification_debug)
                 
         except Exception as e:
             logger.error(f"LLM verification error: {e}, using fallback")
-            return self._rule_based_verify(answer, retrieved_docs)
+            return self._rule_based_verify(answer, retrieved_docs, debug=verification_debug)
 
     def _rule_based_verify(
         self,
         answer: str,
         retrieved_docs: List[RetrievalResult],
+        debug: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fallback rule-based verification."""
         issues: List[str] = []
         confidence = 1.0
 
-        # Rule 1: If answer is "Information not found", it's always valid
-        if answer.strip() == "Information not found.":
-            return self._format_result(True, [], 1.0)
+        # Rule 1: "Information not found" requires checking whether the retrieved docs were actually relevant.
+        if answer.strip().lower().startswith("information not found"):
+            return self._verify_not_found_answer(retrieved_docs, debug=debug)
 
         # Rule 2: Check if answer is empty
         if not answer or len(answer.strip()) == 0:
             issues.append("Answer is empty")
             confidence = 0.0
-            return self._format_result(False, issues, confidence)
+            return self._format_result(False, issues, confidence, debug=debug)
 
         # Rule 3: Check if docs were retrieved
         if not retrieved_docs or not any(
@@ -191,7 +205,53 @@ Respond with JSON:
 
         is_valid = len(issues) == 0 and confidence > 0.5
 
-        return self._format_result(is_valid, issues, confidence)
+        return self._format_result(is_valid, issues, confidence, debug=debug)
+
+    def _verify_not_found_answer(
+        self,
+        retrieved_docs: List[RetrievalResult],
+        debug: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Validate whether a not-found answer is plausible given the retrieved evidence."""
+        if not retrieved_docs or not any(r.chunks for r in retrieved_docs):
+            return self._format_result(True, [], 0.95, debug=debug)
+
+        doc_text = " ".join(chunk.text for r in retrieved_docs for chunk in r.chunks if chunk.text)
+        doc_text_lower = doc_text.lower()
+        has_substantive_context = len(doc_text) >= 300
+        has_numbers = bool(re.search(r"\d", doc_text))
+        finance_hits = sum(1 for keyword in self.FINANCIAL_KEYWORDS if keyword in doc_text_lower)
+
+        if has_substantive_context and (has_numbers or finance_hits >= 2):
+            return self._format_result(
+                False,
+                ["Answer says information was not found, but retrieved context contains substantive financial detail."],
+                0.15,
+                debug=debug,
+            )
+
+        return self._format_result(True, [], 0.8, debug=debug)
+
+    def _verify_evidence_summary_answer(
+        self,
+        retrieved_docs: List[RetrievalResult],
+        debug: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Fast-path validation for constrained evidence-summary fallback answers."""
+        if not retrieved_docs or not any(r.chunks for r in retrieved_docs):
+            return self._format_result(
+                False,
+                ["Evidence-summary answer was produced without retrieved evidence."],
+                0.2,
+                debug=debug,
+            )
+
+        return self._format_result(True, [], 0.72, debug=debug)
+
+    def _extract_claims(self, answer: str) -> List[str]:
+        """Estimate claims in answer using sentence-level heuristic."""
+        sentences = answer.split(".")
+        return [s.strip() for s in sentences if len(s.strip()) > 10]
 
     def _context_has_numbers(self, retrieved_docs: List[RetrievalResult]) -> bool:
         """Check if context contains any numbers."""
@@ -290,14 +350,18 @@ Respond with JSON:
         is_valid: bool,
         issues: List[str],
         confidence: float,
+        debug: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Format verification result."""
-        return {
+        result = {
             "is_valid": is_valid,
             "issues": issues,
             "confidence": max(0.0, min(confidence, 1.0)),
             "issue_count": len(issues),
         }
+        if isinstance(debug, dict):
+            result["debug"] = debug
+        return result
 
     def get_verification_summary(
         self,
